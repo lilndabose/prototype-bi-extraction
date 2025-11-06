@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
-from db import get_db_uri, delete_data_by_date
+from db import get_db_uri, delete_data_by_date, get_lists_of_cost_centers_by_segmentation, get_lists_of_cost_centers_by_management_mode
 from init import init_db
 from flask_cors import CORS
 import os
@@ -11,7 +11,7 @@ from flask import send_from_directory
 from werkzeug.security import safe_join
 import subprocess
 import sys
-from sqlalchemy import create_engine,text
+from sqlalchemy import text
 
 
 app = Flask(__name__)
@@ -226,7 +226,7 @@ def get_filters():
         except Exception as e:
             print(f"Une Erreur c'est produit lors que la recuperations des filtres: {str(e)}")
         
-        dates = sorted(files_creation_date, reverse=True)
+        dates = sorted(files_creation_date)
         return jsonify({
             "files_creation_date": [' '] + dates,  
             "station_code": station_codes,
@@ -259,6 +259,15 @@ def get_stats():
     affiliate_param = query_params.get('affiliate')
     station_code_param = query_params.get('station_code')
     station_name_param = query_params.get('station_name')
+    management_mode_param = query_params.get('management_mode')
+    segmentation_param = query_params.get('segmentation')
+    selected_station_codes = []
+    selected_segmentation_station_codes = []
+
+    if( management_mode_param ):
+        selected_station_codes = get_lists_of_cost_centers_by_management_mode(db, management_mode_param)
+    if( segmentation_param ):
+        selected_segmentation_station_codes = get_lists_of_cost_centers_by_segmentation(db, segmentation_param)
 
     try:
         where_conditions = ["DATE(`date`) = :query_date"]
@@ -284,6 +293,22 @@ def get_stats():
             where_conditions.append("`station name` = :station_name")
             query_params_dict["station_name"] = station_name_param
         
+        # Filter by management mode station codes
+        if management_mode_param and selected_station_codes:
+            if len(selected_station_codes) > 0:
+                placeholders = ','.join([f':station_code_{i}' for i in range(len(selected_station_codes))])
+                where_conditions.append(f"`station code` IN ({placeholders})")
+                for i, code in enumerate(selected_station_codes):
+                    query_params_dict[f'station_code_{i}'] = code
+        
+        # Filter by segmentation station codes
+        if segmentation_param and selected_segmentation_station_codes:
+            if len(selected_segmentation_station_codes) > 0:
+                placeholders = ','.join([f':seg_station_code_{i}' for i in range(len(selected_segmentation_station_codes))])
+                where_conditions.append(f"`station code` IN ({placeholders})")
+                for i, code in enumerate(selected_segmentation_station_codes):
+                    query_params_dict[f'seg_station_code_{i}'] = code
+        
         where_clause = " AND ".join(where_conditions)
         
         # Query to get averages for each EP, ES, ET column
@@ -298,6 +323,7 @@ def get_stats():
                 AVG(`es07`) as es07_mean, AVG(`es08`) as es08_mean, AVG(`es09`) as es09_mean,
                 AVG(`et01`) as et01_mean, AVG(`et02`) as et02_mean, AVG(`et03`) as et03_mean,
                 AVG(`et04`) as et04_mean, AVG(`et05`) as et05_mean,
+                SUM(CASE WHEN `zone` = 'AFR' THEN 1 ELSE 0 END) as afr_count,
                 COUNT(*) as total_records
             FROM hse_variants
             WHERE {where_clause}
@@ -327,6 +353,55 @@ def get_stats():
         total_score_result = db.session.execute(total_score_query, query_params_dict).fetchone()
         total_score_mean = round(float(total_score_result[0]), 2) if total_score_result and total_score_result[0] is not None else 0
         
+        # Query to get management modes statistics from extractions table
+        # Filter by date and zone='All' and sub-zone='All'
+        management_modes_query = text("""
+            SELECT 
+                `coco inspected`,
+                `codo inspected`,
+                `dodo inspected`,
+                `stations inspected`
+            FROM extractions
+            WHERE DATE(`date`) = :query_date 
+            AND `zone` = 'All' 
+            AND `sub-zone` = 'All'
+            LIMIT 1
+        """)
+        
+        management_result = db.session.execute(management_modes_query, query_params_dict).fetchone()
+        
+        # Calculate percentages
+        management_modes = {
+            "COCO": 0,
+            "CODO": 0,
+            "DODO": 0
+        }
+        
+        if management_result:
+            try:
+                # Convert to integers, handling potential None values
+                coco_inspected = int(management_result[0]) if management_result[0] is not None else 0
+                codo_inspected = int(management_result[1]) if management_result[1] is not None else 0
+                dodo_inspected = int(management_result[2]) if management_result[2] is not None else 0
+                stations_total = int(management_result[3]) if management_result[3] is not None else 0
+                
+                if stations_total > 0:
+                    management_modes["COCO"] = round((coco_inspected / stations_total) * 100)
+                    management_modes["CODO"] = round((codo_inspected / stations_total) * 100)
+                    management_modes["DODO"] = round((dodo_inspected / stations_total) * 100)
+            except (ValueError, TypeError) as e:
+                print(f"Error converting management modes data: {e}")
+                # Keep default values of 0
+                
+        # query to get the total records and afr records
+        total_records_query = text("""
+            SELECT SUM(CASE WHEN `zone` = 'AFR' THEN 1 ELSE 0 END) as afr_count,
+                COUNT(*) as total_records from hse_variants WHERE DATE(`date`) = :query_date 
+        """)
+        
+        total_records_result = db.session.execute(total_records_query, query_params_dict).fetchone()
+        total_afr_records = total_records_result[0] if total_records_result else 0
+        
         if not result or result[-1] == 0:
             return jsonify({
                 "date": date_param,
@@ -336,9 +411,10 @@ def get_stats():
                 "station_name": station_name_param,
                 "affiliate": affiliate_param,
                 "message": "Aucune donnée trouvée pour ces filtres",
-                "data": None
+                "data": None,
+                "management_modes": management_modes
             }), 200
-        
+
         ep_data = {}
         es_data = {}
         et_data = {}
@@ -369,7 +445,9 @@ def get_stats():
             "station_name": station_name_param,
             "affiliate": affiliate_param,
             "total_records": format_to_k(result[-1]),
+            "total_afr_records": format_to_k(total_afr_records),
             "total_score_mean": total_score_mean,
+            "management_modes": management_modes,
             "ep": ep_data,
             "es": es_data,
             "et": et_data
@@ -379,7 +457,7 @@ def get_stats():
         return jsonify({
             "error": f"Erreur lors de la récupération des statistiques: {str(e)}"
         }), 500
-
+                
 # declancher l'extraction des fichier
 @app.route('/extract', methods=['GET'])
 def execute_test():
